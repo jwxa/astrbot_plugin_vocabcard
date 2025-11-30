@@ -19,8 +19,12 @@ import random
 import traceback
 import urllib.parse
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
+from astrbot.api.star import StarTools
 
+# 获取当前插件目录的绝对路径
+PLUGIN_DIR = StarTools.get_data_dir("astrbot_plugin_vacabcard")
+RESOURCE_DIR = os.path.join(PLUGIN_DIR, "resource")
 
 # 主题色列表 - 用于随机选择
 THEME_COLORS = [
@@ -36,6 +40,24 @@ THEME_COLORS = [
     "#533483",  # 紫罗兰
 ]
 
+LANGUAGE_META = {
+    "en": {
+        "name": "英语",
+        "words_file": "words.json",
+        "tags": ["CET6", "Daily"],
+        "brand": "Daily Vocab",
+    },
+    "ja": {
+        "name": "日语",
+        "words_file": "words_ja.json",
+        "tags": ["JLPT", "Daily"],
+        "brand": "Daily Nihongo",
+        "media_dir": RESOURCE_DIR + "/eggrolls-JLPT10k-v3/medias",
+    },
+}
+
+DEFAULT_LANGUAGE = "en"
+
 
 def get_beijing_time() -> datetime.datetime:
     """获取北京时间（东八区）- 兼容 Docker 容器 UTC 时间"""
@@ -44,19 +66,25 @@ def get_beijing_time() -> datetime.datetime:
     return utc_now + beijing_offset
 
 
-@register("vocabcard", "Assistant", "每日英语单词卡片推送插件 - 玻璃拟态风格", "1.0.0")
+@register("vocabcard", "Assistant", "每日英语/日语单词卡片推送插件 - 玻璃拟怀风格", "1.2.0")
 class VocabCardPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self.language = self._normalize_language(self.config.get("learning_language", DEFAULT_LANGUAGE))
+        if self.language not in LANGUAGE_META:
+            self.language = DEFAULT_LANGUAGE
         self.plugin_dir = Path(__file__).parent
         self.data_dir = self.plugin_dir / "data"
         self.template_path = self.plugin_dir / "templates" / "card.html"
         self.backgrounds_dir = self.plugin_dir / "photos"  # 离线背景图目录
+        self._media_dir_cache: Dict[str, Optional[Path]] = {}
+        self._missing_audio_logged: Set[str] = set()
 
         # 加载词汇数据和进度
-        self.words: List[Dict] = self._load_words()
+        self.words: List[Dict] = self._load_words(self.language)
         self.progress: Dict = self._load_progress()
+        self._ensure_lang_progress(self.language)
         self.offline_backgrounds: List[Path] = self._load_offline_backgrounds()
 
         # 定时任务相关
@@ -109,16 +137,39 @@ class VocabCardPlugin(Star):
         # 返回 file:// URL
         return f"file:///{bg_path.as_posix()}"
 
-    def _load_words(self) -> List[Dict]:
+    def _load_words(self, language: str) -> List[Dict]:
         """加载词汇数据"""
-        words_file = self.data_dir / "words.json"
+        lang = self._normalize_language(language)
+        meta = LANGUAGE_META.get(lang, LANGUAGE_META[DEFAULT_LANGUAGE])
+        words_file = self.data_dir / meta["words_file"]
         if words_file.exists():
             try:
                 with open(words_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    raw_words = json.load(f)
+                prepared: List[Dict] = []
+                for item in raw_words:
+                    if isinstance(item, dict) and item.get("word"):
+                        prepared.append(self._prepare_word(lang, item))
+                return prepared
             except Exception as e:
                 logger.error(f"加载词汇数据失败: {e}")
+        else:
+            logger.warning(f"未找到 {lang} 词库文件: {words_file}")
         return []
+
+    def _prepare_word(self, language: str, word: Dict) -> Dict:
+        """预处理具有语言特征的单词条目。"""
+        lang = self._normalize_language(language)
+        meta = LANGUAGE_META.get(lang, LANGUAGE_META[DEFAULT_LANGUAGE])
+        prepared = dict(word)
+        prepared.setdefault("tags", meta.get("tags", []))
+        prepared.setdefault("brand", meta.get("brand", meta.get("name", "")))
+        if lang == "ja":
+            reading = prepared.get("reading") or prepared.get("phonetic") or ""
+            pitch = prepared.get("pitch", "")
+            if reading and not prepared.get("phonetic"):
+                prepared["phonetic"] = f"{reading} ? {pitch}" if pitch else reading
+        return prepared
 
     def _load_progress(self) -> Dict:
         """加载学习进度"""
@@ -126,10 +177,29 @@ class VocabCardPlugin(Star):
         if progress_file.exists():
             try:
                 with open(progress_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # 兼容旧格式 {"sent_words": [], "last_push_date": ""}
+                    if isinstance(data, dict) and "sent_words" in data:
+                        return {
+                            DEFAULT_LANGUAGE: {
+                                "sent_words": data.get("sent_words", []),
+                                "last_push_date": data.get("last_push_date", ""),
+                            }
+                        }
+                    # 新格式 {lang: {sent_words: [], last_push_date: ""}}
+                    if isinstance(data, dict):
+                        cleaned = {}
+                        for lang, value in data.items():
+                            if isinstance(value, dict):
+                                cleaned[lang] = {
+                                    "sent_words": value.get("sent_words", []),
+                                    "last_push_date": value.get("last_push_date", ""),
+                                }
+                        if cleaned:
+                            return cleaned
             except Exception as e:
                 logger.error(f"加载进度数据失败: {e}")
-        return {"sent_words": [], "last_push_date": ""}
+        return {DEFAULT_LANGUAGE: {"sent_words": [], "last_push_date": ""}}
 
     def _save_progress(self):
         """保存学习进度"""
@@ -140,15 +210,134 @@ class VocabCardPlugin(Star):
         except Exception as e:
             logger.error(f"保存进度数据失败: {e}")
 
+    def _normalize_language(self, language: str) -> str:
+        return (language or DEFAULT_LANGUAGE).lower()
+
+    def _language_display(self, language: Optional[str] = None) -> str:
+        lang = self._normalize_language(language or self.language)
+        return LANGUAGE_META.get(lang, LANGUAGE_META[DEFAULT_LANGUAGE]).get("name", lang)
+
+    def _ensure_lang_progress(self, language: str) -> Dict:
+        lang = self._normalize_language(language)
+        if lang not in self.progress:
+            self.progress[lang] = {"sent_words": [], "last_push_date": ""}
+        return self.progress[lang]
+
+    def _current_progress(self) -> Dict:
+        return self._ensure_lang_progress(self.language)
+
+    def _get_media_dir(self, language: Optional[str] = None) -> Optional[Path]:
+        lang = self._normalize_language(language or self.language)
+        if lang in self._media_dir_cache:
+            return self._media_dir_cache[lang]
+
+        candidates = []
+        custom_dir = self.config.get(f"{lang}_media_dir")
+        if custom_dir:
+            candidates.append(Path(custom_dir))
+        meta_dir = LANGUAGE_META.get(lang, {}).get("media_dir")
+        if meta_dir:
+            meta_path = Path(meta_dir)
+            if not meta_path.is_absolute():
+                meta_path = (self.plugin_dir / meta_path).resolve()
+            candidates.append(meta_path)
+        if lang == "ja":
+            candidates.append((self.plugin_dir.parent / "_refs" / "anki-jlpt-decks" / "eggrolls-JLPT10k-v3" / "medias").resolve())
+
+        for candidate in candidates:
+            if candidate and candidate.exists():
+                self._media_dir_cache[lang] = candidate
+                return candidate
+
+        self._media_dir_cache[lang] = None
+        return None
+
+    def _resolve_audio_source(self, audio_name: Optional[str], language: Optional[str] = None) -> Optional[str]:
+        if not audio_name:
+            return None
+
+        name = str(audio_name).strip()
+        if not name:
+            return None
+
+        lang = self._normalize_language(language or self.language)
+
+        if name.startswith("http"):
+            return name
+
+        media_dir = self._get_media_dir(lang)
+        if media_dir:
+            local_path = media_dir / name
+            if local_path.exists():
+                return str(local_path)
+
+        base_url = None
+        if lang == "ja":
+            # /eggrolls-JLPT10k-v3/medias
+            base_url = RESOURCE_DIR + self.config.get("ja_media_dir")
+
+        if not base_url:
+            base_url = LANGUAGE_META.get(lang, {}).get("media_base_url")
+
+        if base_url:
+            return f"{base_url.rstrip('/')}/{name}"
+
+        key = f"{lang}:{name}"
+        if key not in self._missing_audio_logged:
+            logger.warning(f"未找到 {lang} 音频文件: {name}")
+            self._missing_audio_logged.add(key)
+        return None
+
+    def _append_audio_components(self, chain: MessageChain, word: Optional[Dict]):
+        if not word:
+            return
+        for audio_key in ("audio", "sentence_audio"):
+            source = self._resolve_audio_source(word.get(audio_key))
+            if not source:
+                continue
+            try:
+                if source.startswith("http"):
+                    chain.chain.append(Comp.Record.fromURL(source))
+                else:
+                    chain.chain.append(Comp.Record.fromFileSystem(source))
+            except Exception as e:
+                logger.error(f"附加音频 {source} 失败: {e}")
+
+    def _compose_card_chain(self, word: Dict, image_path: str, include_title: bool = False) -> MessageChain:
+        chain = MessageChain()
+        if include_title:
+            word_text = word.get("word", "单词") if word else "单词"
+            chain.message(f"📚 每日单词: {word_text}")
+        chain.file_image(image_path)
+        self._append_audio_components(chain, word)
+        return chain
+
+    def _switch_language(self, language: str) -> bool:
+        lang = self._normalize_language(language)
+        if lang not in LANGUAGE_META:
+            return False
+        self.language = lang
+        self.words = self._load_words(lang)
+        self._ensure_lang_progress(lang)
+        self._save_progress()
+        # 切换语言后清理缓存，避免不同词库混用
+        self._cached_image_path = None
+        self._current_word = None
+        self._media_dir_cache.pop(lang, None)
+        self._missing_audio_logged.clear()
+        self.config["learning_language"] = lang
+        self.config.save_config()
+        return True
+
     async def initialize(self):
         """异步初始化"""
-        logger.info(f"单词卡片插件初始化完成，已加载 {len(self.words)} 个单词")
+        logger.info(f"单词卡片插件初始化完成（{self._language_display()}），已加载 {len(self.words)} 个单词")
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         """AstrBot 启动后启动定时任务"""
         self._scheduler_task = asyncio.create_task(self._schedule_loop())
-        logger.info("单词卡片定时任务已启动")
+        logger.info("单词卡片定时任务已启用")
 
     async def _schedule_loop(self):
         """定时任务主循环 - 智能睡眠，精准触发"""
@@ -248,14 +437,15 @@ class VocabCardPlugin(Star):
         if not self.words:
             return None
 
-        sent_words = set(self.progress.get("sent_words", []))
+        current_progress = self._current_progress()
+        sent_words = set(current_progress.get("sent_words", []))
         available = [w for w in self.words if w["word"] not in sent_words]
 
         # 如果全部推送完毕
         if not available:
             if self.config.get("reset_on_complete", True):
                 # 重置进度
-                self.progress["sent_words"] = []
+                current_progress["sent_words"] = []
                 self._save_progress()
                 available = self.words
                 logger.info("所有单词已推送完毕，已重置进度")
@@ -271,9 +461,10 @@ class VocabCardPlugin(Star):
 
     def _mark_word_sent(self, word: str):
         """标记单词已推送"""
-        if word not in self.progress["sent_words"]:
-            self.progress["sent_words"].append(word)
-        self.progress["last_push_date"] = get_beijing_time().strftime("%Y-%m-%d")
+        progress = self._current_progress()
+        if word not in progress["sent_words"]:
+            progress["sent_words"].append(word)
+        progress["last_push_date"] = get_beijing_time().strftime("%Y-%m-%d")
         self._save_progress()
 
     def _generate_bg_prompt(self, word: Dict) -> str:
@@ -322,6 +513,14 @@ class VocabCardPlugin(Star):
         html = html.replace("{{bg_url}}", bg_url)
         html = html.replace("{{theme_color}}", theme_color)
         html = html.replace("{{bg_position}}", bg_position)
+        language_meta = LANGUAGE_META.get(self.language, LANGUAGE_META[DEFAULT_LANGUAGE])
+        tags = word.get("tags", language_meta.get("tags", []))
+        brand = word.get("brand", language_meta.get("brand", "Daily Vocab"))
+        tag1 = f"#{tags[0]}" if tags else "#Vocab"
+        tag2 = f"#{tags[1]}" if len(tags) > 1 else "#Daily"
+        html = html.replace("{{tag1}}", tag1)
+        html = html.replace("{{tag2}}", tag2)
+        html = html.replace("{{brand}}", brand)
 
         return html
 
@@ -415,7 +614,7 @@ class VocabCardPlugin(Star):
         """生成每日单词卡片"""
         word = self._select_word()
         if not word:
-            logger.warning("没有可用的单词")
+            logger.warning(f"没有可用的单词（当前词库: {self._language_display()}）")
             return
 
         try:
@@ -439,14 +638,10 @@ class VocabCardPlugin(Star):
             return
 
         success_count = 0
-        word_text = self._current_word.get("word", "单词") if self._current_word else "单词"
 
         for umo in target_groups:
             try:
-                # 构建消息链
-                chain = MessageChain()
-                chain.message(f"📚 每日单词: {word_text}")
-                chain.file_image(self._cached_image_path)
+                chain = self._compose_card_chain(self._current_word or {}, self._cached_image_path, include_title=True)
 
                 await self.context.send_message(umo, chain)
                 success_count += 1
@@ -471,13 +666,14 @@ class VocabCardPlugin(Star):
         """手动获取一个单词卡片"""
         word = self._select_word()
         if not word:
-            yield event.plain_result("没有可用的单词数据")
+            yield event.plain_result(f"没有可用的单词数据（当前词库: {self._language_display()}）")
             return
 
         # 静默生成，不发送提示
         try:
             image_path = await self._generate_card_image(word)
-            yield event.image_result(image_path)
+            chain = self._compose_card_chain(word, image_path)
+            yield event.chain_result(chain.chain)
 
             # 清理图片
             try:
@@ -491,12 +687,13 @@ class VocabCardPlugin(Star):
     @filter.command("vocab_status")
     async def cmd_status(self, event: AstrMessageEvent):
         """查看学习进度"""
+        progress = self._current_progress()
         total = len(self.words)
-        sent = len(self.progress.get("sent_words", []))
+        sent = len(progress.get("sent_words", []))
         percent = sent * 100 // total if total > 0 else 0
-        last_date = self.progress.get("last_push_date", "未知")
+        last_date = progress.get("last_push_date", "未知")
 
-        msg = f"""📊 单词学习进度
+        msg = f"""📊 单词学习进度（{self._language_display()}）
 ━━━━━━━━━━━━━━━━
 ✅ 已学习: {sent} 个
 📚 总词汇: {total} 个
@@ -504,6 +701,34 @@ class VocabCardPlugin(Star):
 📅 最后推送: {last_date}
 ━━━━━━━━━━━━━━━━"""
         yield event.plain_result(msg)
+
+    @filter.command("vocab_lang")
+    async def cmd_change_language(self, event: AstrMessageEvent, language: str = ""):
+        """切换词库语言"""
+        supported = ", ".join([f"{code}({meta['name']})" for code, meta in LANGUAGE_META.items()])
+        if not language:
+            yield event.plain_result(
+                f"当前词库: {self._language_display()} ({self.language})\n支持: {supported}\n用法: /vocab_lang en|ja"
+            )
+            return
+
+        lang = self._normalize_language(language)
+        if lang not in LANGUAGE_META:
+            yield event.plain_result(f"不支持的语言: {language}\n支持: {supported}")
+            return
+
+        if lang == self.language:
+            yield event.plain_result(f"已在 {self._language_display()} 词库，无需切换")
+            return
+
+        if not self._switch_language(lang):
+            yield event.plain_result("切换失败，请检查配置或词库文件")
+            return
+
+        notice = f"已切换到 {self._language_display()} 词库，词条数: {len(self.words)}"
+        if not self.words:
+            notice += "\n⚠️ 词库为空，请检查 data 目录中的词库文件"
+        yield event.plain_result(notice)
 
     @filter.command("vocab_register")
     async def cmd_register(self, event: AstrMessageEvent):
@@ -561,9 +786,8 @@ class VocabCardPlugin(Star):
 
                 image_path = await self._generate_card_image(word)
 
-                # 发送到当前会话
-                yield event.plain_result(f"📚 测试单词: {word['word']}")
-                yield event.image_result(image_path)
+                chain = self._compose_card_chain(word, image_path, include_title=True)
+                yield event.chain_result(chain.chain)
 
                 # 清理
                 try:
@@ -605,7 +829,7 @@ class VocabCardPlugin(Star):
                 try:
                     await self._generate_daily_card()
                     if self._cached_image_path:
-                        word_text = self._current_word.get('word', '?') if self._current_word else '?'
+                        word_text = self._current_word.get("word", "?") if self._current_word else "?"
                         yield event.plain_result(f"✅ 卡片生成成功: {word_text}")
                     else:
                         yield event.plain_result("❌ 卡片生成失败：缓存路径为空")
@@ -664,6 +888,7 @@ class VocabCardPlugin(Star):
         info_msg = f"""🔍 单词预览
 ━━━━━━━━━━━━━━━━━━━━
 📝 单词: {word.get('word', '')}
+🌐 词库: {self._language_display()}
 🔊 音标: {word.get('phonetic', '')}
 📚 词性: {word.get('pos', '')}
 📖 释义: {word.get('definition_cn', '')}
@@ -675,8 +900,9 @@ class VocabCardPlugin(Star):
         try:
             # 生成图片
             image_path = await self._generate_card_image(word)
+            chain = self._compose_card_chain(word, image_path)
             yield event.plain_result("✅ 图片生成成功！")
-            yield event.image_result(image_path)
+            yield event.chain_result(chain.chain)
 
             # 清理
             try:
@@ -736,6 +962,7 @@ class VocabCardPlugin(Star):
 /vocab_status - 查看学习进度
 /vocab_register - 注册每日推送
 /vocab_unregister - 取消每日推送
+/vocab_lang [en|ja] - 切换词库语言（英语/日语）
 /vocab_test - 测试推送功能
 /vocab_help - 显示此帮助
 ━━━━━━━━━━━━━━━━━━━━

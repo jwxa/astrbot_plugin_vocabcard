@@ -36,10 +36,23 @@
     "hint": "当AI背景关闭时使用的默认背景图片URL",
     "default": ""
   },
+  "learning_language": {
+    "description": "学习语言",
+    "type": "string",
+    "options": [
+      "en",
+      "ja"
+    ],
+    "hint": "en: 英语词库; ja: 日语词库",
+    "default": "en"
+  },
   "learning_mode": {
     "description": "学习模式",
     "type": "string",
-    "options": ["sequential", "random"],
+    "options": [
+      "sequential",
+      "random"
+    ],
     "hint": "sequential: 顺序学习; random: 随机学习",
     "default": "random"
   },
@@ -48,5 +61,11 @@
     "type": "bool",
     "hint": "所有单词推送完毕后自动从头开始",
     "default": true
+  },
+  "ja_media_dir": {
+    "description": "日语音频目录",
+    "type": "string",
+    "hint": "自动寻找astrbot/data/plugin_data/astrbot_plugin_vocabcard/resource下的目录，示例：/eggrolls-JLPT10k-v3/medias",
+    "default": ""
   }
 }

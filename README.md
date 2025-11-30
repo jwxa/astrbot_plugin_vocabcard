@@ -15,9 +15,12 @@
 - 🖼️ **本地背景图库**：内置 37 张精选背景图，随机裁剪增加多样性
 - 📅 **定时推送**：每天自动生成并推送单词卡片到群聊
 - 📖 **丰富词库**：包含 3722+ 个 CET-6 核心词汇
+- 🇯🇵 **JLPT 词库**：集成 anki-jlpt-decks（N1-N5 1w+ 词条，含例句与音频）
+- 🔊 **音频伴随**：发送日语卡片时自动附带单词与例句音频（可配置本地目录或媒体服务）
 - 🎲 **随机学习**：支持随机或顺序学习模式
 - 📊 **进度追踪**：自动记录学习进度，支持查看统计
 - 🔧 **灵活配置**：可自定义推送时间、学习模式等
+- 🌏 **双语词库**：支持英语/日语词库切换
 - 🎯 **多种命令**：支持手动获取、预览、测试等功能
 
 ## 📸 效果预览
@@ -71,6 +74,7 @@ playwright install chromium
 | `/vocab_status` | 查看学习进度统计 |
 | `/vocab_register` | 在当前会话注册每日推送 |
 | `/vocab_unregister` | 取消当前会话的每日推送 |
+| `/vocab_lang [en|ja]` | 切换词库语言（英语/日语） |
 | `/vocab_help` | 显示帮助信息 |
 
 ### 高级命令
@@ -118,11 +122,16 @@ playwright install chromium
   "target_groups": [],              // 推送目标群列表（自动管理）
   "push_time_generate": "07:30",    // 卡片生成时间
   "push_time_send": "08:00",        // 卡片推送时间
+  "learning_language": "en",        // en: 英语词库; ja: 日语词库
   "learning_mode": "random",        // 学习模式：random(随机) / sequential(顺序)
   "reset_on_complete": true,        // 学完所有单词后是否自动重置
-  "enable_ai_background": false     // 是否启用 AI 生成背景（当前使用本地图库）
+  "enable_ai_background": false,    // 是否启用 AI 生成背景（当前使用本地图库）
+  "ja_media_dir": "",               // 日语音频目录，留空自动寻找 _refs/anki-jlpt-decks/.../medias
+  "ja_media_base_url": ""           // 可选：配合 ankicommunity-sync-server 的媒体 URL 基址
 }
 ```
+
+> 日语词库基于 [5mdld/anki-jlpt-decks](https://github.com/5mdld/anki-jlpt-decks)，音频默认读取 `_refs/anki-jlpt-decks/eggrolls-JLPT10k-v3/medias`，可使用 `scripts/build_jlpt_dataset.py` 重建 `data/words_ja.json` 或配置自定义路径。
 
 ### 自定义推送时间
 
@@ -150,6 +159,7 @@ astrbot_plugin_vocabcard/
 ├── requirements.txt        # Python 依赖
 ├── data/
 │   ├── words.json         # 词汇数据（3722 个单词）
+│   ├── words_ja.json      # JLPT N1-N5 日语词库（含音频文件名）
 │   └── progress.json      # 学习进度记录
 ├── templates/
 │   └── card.html          # 卡片 HTML 模板
@@ -158,6 +168,7 @@ astrbot_plugin_vocabcard/
 │   └── ...
 └── scripts/
     ├── clean_data.py      # 数据清洗脚本
+    ├── build_jlpt_dataset.py    # 从 anki-jlpt-decks 生成日语词库
     └── download_backgrounds.py  # 背景图下载脚本
 ```
 

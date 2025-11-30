@@ -1,4 +1,10 @@
 {
-  "sent_words": [],
-  "last_push_date": ""
+  "en": {
+    "sent_words": [],
+    "last_push_date": ""
+  },
+  "ja": {
+    "sent_words": [],
+    "last_push_date": ""
+  }
 }
