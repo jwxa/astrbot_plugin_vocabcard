@@ -271,13 +271,8 @@ class VocabCardPlugin(Star):
             if local_path.exists():
                 return str(local_path)
 
-        base_url = None
-        if lang == "ja":
-            # /eggrolls-JLPT10k-v3/medias
-            base_url = RESOURCE_DIR + self.config.get("ja_media_dir")
-
-        if not base_url:
-            base_url = LANGUAGE_META.get(lang, {}).get("media_base_url")
+        # 远程媒体基址（可选，用于 HTTP 直链）
+        base_url = self.config.get(f"{lang}_media_base_url") or LANGUAGE_META.get(lang, {}).get("media_base_url")
 
         if base_url:
             return f"{base_url.rstrip('/')}/{name}"
@@ -288,29 +283,49 @@ class VocabCardPlugin(Star):
             self._missing_audio_logged.add(key)
         return None
 
-    def _append_audio_components(self, chain: MessageChain, word: Optional[Dict]):
+    def _build_audio_components(self, word: Optional[Dict]) -> List[Comp.Record]:
+        """收集单词与例句音频，按顺序返回 Record 列表（单词音频在前，例句音频在后）。"""
+        records: List[Comp.Record] = []
         if not word:
-            return
-        for audio_key in ("audio", "sentence_audio"):
+            return records
+
+        for audio_key in ("audio", "sentence_audio"):  # 保持固定顺序
             source = self._resolve_audio_source(word.get(audio_key))
             if not source:
                 continue
             try:
-                if source.startswith("http"):
-                    chain.chain.append(Comp.Record.fromURL(source))
-                else:
-                    chain.chain.append(Comp.Record.fromFileSystem(source))
+                record = Comp.Record.fromURL(source) if source.startswith("http") else Comp.Record.fromFileSystem(source)
+                records.append(record)
             except Exception as e:
                 logger.error(f"附加音频 {source} 失败: {e}")
+        return records
 
-    def _compose_card_chain(self, word: Dict, image_path: str, include_title: bool = False) -> MessageChain:
-        chain = MessageChain()
+    def _build_message_chains(self, word: Dict, image_path: str, include_title: bool = False) -> List[MessageChain]:
+        """
+        生成分段消息链：
+        1. 标题(可选) + 图片
+        2. 单词音频
+        3. 例句音频
+        """
+        chains: List[MessageChain] = []
+
+        # 标题 + 图片
+        img_chain = MessageChain()
         if include_title:
             word_text = word.get("word", "单词") if word else "单词"
-            chain.message(f"📚 每日单词: {word_text}")
-        chain.file_image(image_path)
-        self._append_audio_components(chain, word)
-        return chain
+            img_chain.message(f"📚 每日单词: {word_text}")
+        if image_path.startswith("http"):
+            img_chain.chain.append(Comp.Image.fromURL(image_path))
+        else:
+            img_chain.chain.append(Comp.Image.fromFileSystem(image_path))
+        chains.append(img_chain)
+
+        # 音频（拆分为独立消息链）
+        audio_records = self._build_audio_components(word)
+        for rec in audio_records:
+            chains.append(MessageChain([rec]))
+
+        return chains
 
     def _switch_language(self, language: str) -> bool:
         lang = self._normalize_language(language)
@@ -641,9 +656,10 @@ class VocabCardPlugin(Star):
 
         for umo in target_groups:
             try:
-                chain = self._compose_card_chain(self._current_word or {}, self._cached_image_path, include_title=True)
+                chains = self._build_message_chains(self._current_word or {}, self._cached_image_path, include_title=True)
 
-                await self.context.send_message(umo, chain)
+                for chain in chains:
+                    await self.context.send_message(umo, chain)
                 success_count += 1
                 logger.info(f"已推送到: {umo}")
             except Exception as e:
@@ -672,8 +688,9 @@ class VocabCardPlugin(Star):
         # 静默生成，不发送提示
         try:
             image_path = await self._generate_card_image(word)
-            chain = self._compose_card_chain(word, image_path)
-            yield event.chain_result(chain.chain)
+            chains = self._build_message_chains(word, image_path)
+            for chain in chains:
+                yield event.chain_result(chain.chain)
 
             # 清理图片
             try:
@@ -786,8 +803,9 @@ class VocabCardPlugin(Star):
 
                 image_path = await self._generate_card_image(word)
 
-                chain = self._compose_card_chain(word, image_path, include_title=True)
-                yield event.chain_result(chain.chain)
+                chains = self._build_message_chains(word, image_path, include_title=True)
+                for chain in chains:
+                    yield event.chain_result(chain.chain)
 
                 # 清理
                 try:
@@ -900,9 +918,10 @@ class VocabCardPlugin(Star):
         try:
             # 生成图片
             image_path = await self._generate_card_image(word)
-            chain = self._compose_card_chain(word, image_path)
+            chains = self._build_message_chains(word, image_path)
             yield event.plain_result("✅ 图片生成成功！")
-            yield event.chain_result(chain.chain)
+            for chain in chains:
+                yield event.chain_result(chain.chain)
 
             # 清理
             try:
